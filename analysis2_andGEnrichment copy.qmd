@@ -1,0 +1,1075 @@
+---
+title: "Analysis"
+author: "Michel Tarnow, Clara Lepsius, Gonzalo Cardenal"
+date: today
+format: 
+    html:
+      toc: true
+      self-contained: true
+      highlight-style: github
+      code-line-numbers: true
+editor_options: 
+    chunk_output_type: inline
+---
+
+## Load packages
+
+```{r, message=FALSE}
+library(biomaRt)
+library(limma)
+library(affy)
+library(preprocessCore)
+library(UpSetR)
+library(tidyverse)
+library(RColorBrewer)
+library(pheatmap)
+library(edgeR)
+library(DESeq2)
+library(ggrepel)
+library(pbapply)
+library(viridis)
+library(gplots)
+library(msigdbr)
+library(fgsea)
+library(viridis)
+library(UpSetR)
+library(tximport)
+```
+
+## Data import
+
+Import TPM count data from rsem .genes.results files:
+
+```{r, eval = FALSE}
+# my code
+
+directory_path <-
+  "~/OneDrive - ETH Zurich/CBB/FS1/Systems Genomics/sysgenom/data_new/gene_results/"
+file_list <- list.files(directory_path)
+
+expr <- data.frame(matrix(NA_integer_, nrow = 56884, ncol = 23))
+names <- c()
+for (i in file_list) {
+  names <- append(names, unlist(strsplit(i, ".genes.results")))
+}
+colnames(expr) <- names
+for (i in 1:length(file_list)) {
+  file <- file.path(directory_path, file_list[i])
+  df <- read.csv(file, sep = "\t")
+  
+  expr[, i] <- df$TPM
+}
+
+rownames(expr) <- df$gene_id
+
+expr <- expr %>%
+  rownames_to_column(var = "gene_name") %>%
+  arrange(gene_name) %>%
+  column_to_rownames(var = "gene_name")
+
+head(expr)
+```
+
+```{r}
+# tutorial code
+samples <- list.files("rsem")
+
+expr2 <- sapply(samples, function(sample) {
+  file <- paste0("rsem/", sample, "/", sample, ".genes.results")
+  quant <- read.csv(file, sep = "\t", header = T)
+  tpm2 <- setNames(quant$TPM, quant$gene_id)
+  return(tpm2)
+})
+
+expr <- as.data.frame(expr2)
+
+expr <- expr %>%
+  rownames_to_column(var = "gene_name") %>%
+  arrange(gene_name) %>%
+  column_to_rownames(var = "gene_name")
+
+head(expr)
+```
+
+```{r}
+sum(expr != expr2)
+```
+
+Both are the same!
+
+Import annotation data for the samples:
+
+```{r}
+# read in meta data for the runs (contains sample and mouse id)
+anno <- read.csv("/Users/gonuni/Desktop/College/CBB/1st Semester/Systems Genomics/Group_project/SraRunTable.txt", sep = ",")
+
+# read in meta data for the samples (contains mouse id and age)
+metadata <-
+  read.csv("/Users/gonuni/Desktop/College/CBB/1st Semester/Systems Genomics/Group_project/BulkSeq_Aging_metadata.txt", sep = "\t")
+
+# join information from anno and metadata to have age of mouse in each sample
+age <- metadata %>%
+  group_by(mouseID) %>%
+  summarise(age)
+ages <- c()
+for (i in anno$mouse_id_number) {
+  ages <- append(ages, age$age[age$mouseID == i])
+}
+anno$age <- ages
+anno <- anno %>%
+  select(Run, mouse_id_number, sex, age, everything())
+
+anno <- anno[order(anno$Run),]
+head(anno)
+```
+
+*This is also the reason why we need multiple replicates of the each conditions; or the experiment would need to be designed in a way that samples from "different conditions" can be seen as "cross-replicates", for instance, a reasonale number of samples all with different time points to study transcriptomic changes across the time course, so that we see the time course as a continuous condition rather than each individual time point as one distinct condition.*
+
+```{r}
+table(anno$age)
+```
+
+Import additional gene information:
+
+`devtools::install_version("dbplyr", version = "2.3.4")`
+`httr::set_config(httr::config(ssl_verifypeer = FALSE))`
+
+```{r}
+ensembl <- useEnsembl(biomart = "ensembl",
+                      dataset = "mmusculus_gene_ensembl")
+
+meta_genes <- getBM(
+  attributes = c(
+    "ensembl_gene_id",
+    "ensembl_gene_id_version",
+    "external_gene_name",
+    "description",
+    "chromosome_name",
+    "start_position",
+    "end_position",
+    "strand"
+  ),
+  filters = "ensembl_gene_id_version",
+  values = rownames(expr),
+  mart = ensembl
+) %>%
+  right_join(data.frame(ensembl_gene_id_version = rownames(expr)),
+             by = "ensembl_gene_id_version") %>%
+  distinct(ensembl_gene_id_version, .keep_all = TRUE)
+
+expr <- expr[meta_genes$ensembl_gene_id_version, ]
+rownames(meta_genes) <- meta_genes$ensembl_gene_id_version
+```
+
+## Exploratory data analysis
+
+```{r}
+dim(expr)
+dim(meta_genes)
+```
+
+We have 56884 annotated genes in 23 samples.
+
+```{r}
+avg_expr <- rowMeans(expr)
+
+layout(matrix(1:2, nrow = 1))
+hist(avg_expr)
+hist(log10(avg_expr + 1))
+
+ggplot(data = as.data.frame(avg_expr), mapping =  aes(x = avg_expr)) +
+  geom_histogram(
+    color = "white",
+    fill = brewer.pal(n = 3, name = "Set1")[2],
+    bins = 50
+  ) +
+  labs(title = "Distribution of average expression values of all genes",
+       x = "Average expression",
+       y = "Count") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggplot(data = as.data.frame(avg_expr), mapping =  aes(x = log(avg_expr + 1))) +
+  geom_histogram(
+    color = "white",
+    fill = brewer.pal(n = 3, name = "Set1")[2],
+    bins = 50
+  ) +
+  labs(title = "Distribution of average expression values of all genes",
+       x = "log10(Average expression + 1)",
+       y = "Count") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r}
+ggplot(data = as.data.frame(avg_expr), mapping =  aes(x = avg_expr)) +
+  geom_histogram(
+    color = "white",
+    fill = brewer.pal(n = 3, name = "Set1")[2],
+    bins = 50
+  ) +
+  scale_x_continuous(
+    breaks = c(0, 1, 10, 100, 1000, 10000, 20000),
+    trans = "log1p",
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(breaks = c(0, 1),
+                     expand = c(0, 0),
+                     trans = "log1p") +
+  labs(title = "Distribution of average expression values of all genes",
+       x = "log1p(Average expression)",
+       y = "log1p(Count)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r}
+num_det <- rowSums(expr > 0)
+
+ggplot(data = as.data.frame(num_det), mapping =  aes(x = num_det)) +
+  geom_histogram(
+    color = "white",
+    fill = brewer.pal(n = 3, name = "Set1")[2],
+    bins = 23
+  ) +
+  labs(title = "Distribution of number samples in which each gene is detected",
+       x = "Number of samples",
+       y = "Count") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+hist(num_det)
+```
+
+The histograms show that many genes are not detected in all or most of the samples, or detected only with low expression. Thus, these genes are filtered out since they are probably not of interest:
+
+```{r}
+# filter expressed genes and add this information to the meta_genes file
+# threshold: genes must be detected in at least half of the samples
+#            and the average TPM must be >= 1
+
+expressed <- rowMeans(expr > 0) >= 0.5 | rowMeans(expr) >= 1
+meta_genes$expressed <- expressed
+
+num_det <- rowSums(expr[meta_genes$expressed,] > 0)
+
+ggplot(data = as.data.frame(num_det), mapping =  aes(x = num_det)) +
+  geom_histogram(
+    color = "white",
+    fill = brewer.pal(n = 3, name = "Set1")[2],
+    bins = 23
+  ) +
+  labs(title = "Distribution of number samples in which each gene is detected",
+       x = "Number of samples",
+       y = "Count") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+hist(num_det)
+```
+
+```{r}
+# compute pairwise correlation between the samples
+
+corr_pearson <- cor(log1p(expr[meta_genes$expressed,]))
+corr_spearman <- cor(expr[meta_genes$expressed,], method = "spearman")
+
+pheatmap(corr_pearson)
+pheatmap(corr_spearman)
+
+hcl_pearson <- hclust(as.dist(1 - corr_pearson))
+hcl_spearman <- hclust(as.dist(1 - corr_spearman))
+
+plot(hcl_pearson, labels = anno$age)
+plot(hcl_spearman, labels = anno$age)
+```
+
+```{r}
+# PCA dimensionality reduction
+
+pca <-
+  prcomp(log1p(t(expr[meta_genes$expressed, ])), center = TRUE, scale. = TRUE)
+
+eigs <- pca$sdev^2
+plot(1:length(eigs), eigs)
+
+ggplot(data = as.data.frame(pca$x),
+       mapping = aes(
+         x = PC1,
+         y = PC2,
+         #color = as.factor(anno$age)
+         color = anno$age,
+         shape = anno$sex
+       )) +
+  geom_point(size = 4) +
+  labs(title = "PCA plot", color = "Age", shape = "Sex") +
+  scale_color_viridis_c() +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+```{r}
+# MDS dimensionality reduction
+
+mds <- plotMDS(log1p(expr[meta_genes$expressed,]), plot = FALSE)
+
+df <- data.frame(MDS1 = mds$x,
+                 MDS2 = mds$y,
+                 age = anno$age,
+                 shape = anno$sex)
+ggplot(df, aes(x = MDS1, y = MDS2, colour = age)) +
+  geom_point(size = 4) +
+  labs(title = "MDS plot", color = "Age") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_color_viridis_c()
+```
+
+## Highly variable genes identification
+
+Function to estimate the variability of the genes:
+
+```{r}
+estimate_variability <- function(expr){
+  means <- apply(expr, 1, mean)
+  vars <- apply(expr, 1, var)
+  cv2 <- vars / means^2
+  
+  minMeanForFit <- unname(median(means[which(cv2 > 0.3)]))
+  useForFit <- means >= minMeanForFit
+  fit <- glm.fit(x = cbind(a0 = 1, a1tilde = 1/means[useForFit]),
+                 y = cv2[useForFit],
+                 family = Gamma(link = "identity"))
+  a0 <- unname(fit$coefficients["a0"])
+  a1 <- unname(fit$coefficients["a1tilde"])
+  
+  xg <- exp(seq(min(log(means[means>0])), max(log(means)), length.out=1000))
+  vfit <- a1/xg + a0
+  df <- ncol(expr) - 1
+  afit <- a1/means+a0
+  varFitRatio <- vars/(afit*means^2)
+  pval <- pchisq(varFitRatio*df,df=df,lower.tail=F)
+  
+  res <- data.frame(mean = means,
+                    var = vars,
+                    cv2 = cv2,
+                    useForFit = useForFit,
+                    pval = pval,
+                    padj = p.adjust(pval, method="BH"),
+                    row.names = rownames(expr))
+  return(res)
+}
+```
+
+Test for significance of over dispersion:
+
+```{r}
+var_genes <- estimate_variability(expr[meta_genes$expressed, ])
+meta_genes$highvar <-
+  meta_genes$ensembl_gene_id_version %in% rownames(var_genes)[which(var_genes$padj < 0.05)]
+```
+
+Hierarchical clustering and PCA only with highly variable and expressed genes:
+
+```{r}
+corr_spearman_highvar <-
+  cor(expr[meta_genes$highvar,], method = "spearman")
+hcl_spearman_highvar <- hclust(as.dist(1 - corr_spearman_highvar))
+plot(hcl_spearman_highvar, labels = anno$age)
+
+pca_highvar <-
+  prcomp(log1p(t(expr[meta_genes$highvar,])), center = TRUE, scale. = TRUE)
+ggplot(data = as.data.frame(pca_highvar$x),
+       mapping = aes(x = PC1,
+                     y = PC2,
+                     color = anno$age,
+                     shape = anno$sex)) +
+  geom_point(size = 4) +
+  labs(title = "PCA plot (only highly variable genes)", color = "Age", shape = "Sex") +
+  scale_color_viridis_c() +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+## Differential expression analysis
+
+*To identify significant differential expression changes with age, we used the raw count matrix as recommended for the DEseq2 standard analysis pipeline. Factors and dispersion estimates were calculated for each region separately. We conducted differential expression analysis comparing samples from 3 months to each consecutive time point, using sex as covariate. This is consistent with previously published differential expression analyses performed across whole organs in mice.8 P values were adjusted for multiple testing, and genes with an adjusted P value of less than 0.05 were determined to be statistically significant. Finally, we required a gene to reach statistical significance (after multiple testing correction) in at least 2 pairwise comparisons (e.g. 3 months vs 18 months and 3 months vs 21 months) to be called a differentially expressed gene (DEG). We chose this criterion to retain only genes with robust differential expression patterns across age groups. We recognize that this tends to select against genes that are differentially expressed very late in life (i.e. 3 months vs 28 months).*
+
+### ANOVA
+
+```{r}
+DE_test <- function(expr,
+                    cond,
+                    ctrl = NULL,
+                    covar = NULL,
+                    padj_method = p.adjust.methods){
+  pval_fc <- data.frame(t(pbapply(expr, 1, function(e){
+    dat <- data.frame(y = log1p(e),
+                      cond = cond)
+    if (! is.null(covar))
+      dat <- data.frame(dat, covar)
+    
+    m1 <- lm(y ~ ., data = dat)
+    m0 <- lm(y ~ . - cond, data = dat)
+    test <- anova(m1, m0)
+    pval <- test$Pr[2]
+    
+    avgs <- tapply(log1p(e), cond, mean)
+    if (! is.null(ctrl) && sum(cond %in% ctrl) > 0){
+      fc <- exp(max(avgs[names(avgs) != ctrl]) - avgs[ctrl])
+    } else{
+      fc <- exp(max(avgs) - min(avgs))
+    }
+    
+    return(c(pval = unname(pval), fc = unname(fc)))
+  })), row.names = rownames(expr))
+  padj <- p.adjust(pval_fc$pval, method = padj_method)
+  return(data.frame(pval_fc, "padj" = padj)[,c("pval","padj","fc")])
+}
+
+# expressed genes
+res_DE <- DE_test(expr = expr[meta_genes$expressed,],
+                  cond = anno$age,
+                  covar = anno$sex) %>%
+  tibble::rownames_to_column("gene")
+```
+
+```{r}
+res_DE <- res_DE %>%
+  mutate(DE = padj < 0.1 & fc > 2) %>%
+  mutate(DEG = ifelse(DE, meta_genes$external_gene_name[meta_genes$expressed], NA))
+
+ggplot(res_DE, aes(
+  x = log(fc),
+  y = -log10(padj),
+  col = DE,
+  label = DEG
+)) +
+  geom_point() +
+  geom_text_repel() +
+  geom_vline(
+    xintercept = c(log(2), 0),
+    col = "#303030",
+    linetype = "dotted"
+  ) +
+  geom_hline(
+    yintercept = -log10(0.1),
+    col = "#303030",
+    linetype = "dotted"
+  ) +
+  scale_color_manual(values = c("#909090", "red")) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  labs(title = "ANOVA differential expression analysis", 
+       x = "logFC", 
+       y = "-log10(p-value)")
+```
+
+## DESeq2
+
+```{r}
+tx2gene <- getBM(attributes = c("ensembl_transcript_id_version",
+                                "ensembl_gene_id_version"),
+                 filters = "ensembl_gene_id_version",
+                 values = rownames(expr),
+                 mart = ensembl) %>%
+  dplyr::select(ensembl_transcript_id_version, ensembl_gene_id_version)
+
+samples <-  list.files("rsem")
+files <- file.path("rsem", samples, paste0(samples,".isoforms.results"))
+txi <- tximport(files, type = "rsem", tx2gene = tx2gene)
+
+dds <- DESeqDataSetFromTximport(txi,
+                                colData = anno,
+                                design = ~ age + sex)
+```
+
+```{r}
+dds_filtered <-
+  dds[intersect(rownames(expr)[meta_genes$expressed], rownames(dds)), ]
+dds_filtered <- DESeq(dds_filtered, test = "LRT", reduced = ~ sex)
+res_DESeq2 <- results(dds_filtered)
+```
+```{r}
+padj <- p.adjust(res_DESeq2$pvalue, method = "holm") < 0.1
+de_genes_deseq2 <- rownames(res_DESeq2)[padj]
+de_genes_deseq2 <- as.vector(na.omit(de_genes_deseq2))
+de_genes_deseq2_ext_name <-
+  meta_genes[de_genes_deseq2,]$external_gene_name
+```
+
+
+## edgeR
+
+```{r}
+samples <- list.files("rsem")
+
+counts <- sapply(samples, function(sample) {
+  file <- paste0("rsem/", sample, "/", sample, ".genes.results")
+  quant <- read.csv(file, sep = "\t", header = T)
+  tpm2 <- setNames(quant$expected_count, quant$gene_id)
+  return(tpm2)
+})
+
+counts <- as.data.frame(counts)
+
+counts <- counts %>% 
+  rownames_to_column(var = "gene_name") %>% 
+  arrange(gene_name) %>% 
+  column_to_rownames(var = "gene_name")
+
+head(counts)
+```
+
+
+```{r}
+# define groups for design matrix
+age <- factor(anno$age)
+sex <- factor(anno$sex)
+
+# convert data to DGEList object
+y <- DGEList(counts = counts[meta_genes$expressed,], group = age, sex = sex)
+
+# normalize the data to account for differences in library sizes and sequencing depth
+y <- calcNormFactors(y)
+
+# create design matrix
+design <- model.matrix( ~ age + sex)
+design
+
+# estimate dispersion
+y <- estimateDisp(y, design)
+
+# fit the negative binomial model
+fit <- glmFit(y, design)
+
+# conduct genewise statistical tests for a given coefficient contrast (coef = row of design matrix)
+lrt_all <- glmLRT(fit, coef = 2:7)
+topTags(lrt_all)
+
+# multiple testing correction
+decide_dif_all <-
+  decideTests.DGELRT(
+    lrt_all,
+    adjust.method = "holm",
+    p.value = 0.1#,
+    #lfc = log(2)
+  )
+
+summary(decide_dif_all)
+
+de_genes_edgeR <- rownames(decide_dif_all[decide_dif_all[,1] != 0,])
+de_genes_edgeR_ext_name <- meta_genes[de_genes_edgeR,]$external_gene_name
+de_genes_edgeR_ext_name
+```
+
+```{r}
+# comparison of 12 and 3 months
+
+lrt <- glmLRT(fit, coef = 2)
+decide_dif <-
+  decideTests.DGELRT(
+    lrt,
+    adjust.method = "holm",
+    p.value = 0.1,
+    lfc = log(2)
+  )
+
+ggplot(
+  data = as.data.frame(lrt$table),
+  mapping = aes(
+    x = abs(logFC),
+    y = -log10(p.adjust(PValue, method = "holm")),
+    label = meta_genes[rownames(y),]$external_gene_name,
+    color = as.factor(decide_dif)
+  )
+) +
+  geom_point() +
+  geom_vline(xintercept = log(2), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.1), linetype = "dashed") +
+  geom_text_repel() +
+  labs(
+    title = "Differential expression 3 vs. 12 months",
+    x = "LogFC",
+    y = "-10log(p-value)",
+    color = "DE"
+  ) +
+  scale_color_brewer(palette = "Set1") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+```{r}
+# comparison of 21 and 3 months
+
+lrt <- glmLRT(fit, coef = 5)
+decide_dif <-
+  decideTests.DGELRT(
+    lrt,
+    adjust.method = "holm",
+    p.value = 0.1,
+    lfc = log(2)
+  )
+
+ggplot(
+  data = as.data.frame(lrt$table),
+  mapping = aes(
+    x = abs(logFC),
+    y = -log10(p.adjust(PValue, method = "holm")),
+    label = meta_genes[rownames(y),]$external_gene_name,
+    color = as.factor(decide_dif)
+  )
+) +
+  geom_point() +
+  geom_vline(xintercept = log(2), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.1), linetype = "dashed") +
+  geom_text_repel() +
+  labs(
+    title = "Differential expression 3 vs. 21 months",
+    x = "LogFC",
+    y = "-10log(p-value)",
+    color = "DE"
+  ) +
+  scale_color_brewer(palette = "Set1") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r}
+# comparison of 28 and 3 months
+
+lrt <- glmLRT(fit, coef = 7)
+decide_dif <-
+  decideTests.DGELRT(
+    lrt,
+    adjust.method = "holm",
+    p.value = 0.1,
+    lfc = log(2)
+  )
+
+ggplot(
+  data = as.data.frame(lrt$table),
+  mapping = aes(
+    x = abs(logFC),
+    y = -log10(p.adjust(PValue, method = "holm")),
+    label = meta_genes[rownames(y),]$external_gene_name,
+    color = as.factor(decide_dif)
+  )
+) +
+  geom_point() +
+  geom_vline(xintercept = log(2), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.1), linetype = "dashed") +
+  geom_text_repel() +
+  labs(
+    title = "Differential expression 3 vs. 28 months",
+    x = "LogFC",
+    y = "-10log(p-value)",
+    color = "DE"
+  ) +
+  scale_color_brewer(palette = "Set1") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+```{r}
+c4b <-
+  data.frame(expression = unlist(as.vector(expr[meta_genes[meta_genes$external_gene_name == "C4b", ]$ensembl_gene_id_version,])), age = anno$age)
+c4b <-
+  c4b %>% group_by(age) %>% summarise(expression = mean(expression))
+c4b
+
+gpr17 <-
+  data.frame(expression = unlist(as.vector(expr[meta_genes[meta_genes$external_gene_name == "Gpr17", ]$ensembl_gene_id_version,])), age = anno$age)
+gpr17 <-
+  gpr17 %>% group_by(age) %>% summarise(expression = mean(expression))
+gpr17
+
+H2Q6 <-
+  data.frame(expression = unlist(as.vector(expr[meta_genes[meta_genes$external_gene_name == "H2-Q6", ]$ensembl_gene_id_version,])), age = anno$age)
+H2Q6 <-
+  H2Q6 %>% group_by(age) %>% summarise(expression = mean(expression))
+H2Q6
+
+H2Q7 <-
+  data.frame(expression = unlist(as.vector(expr[meta_genes[meta_genes$external_gene_name == "H2-Q7", ]$ensembl_gene_id_version,])), age = anno$age)
+H2Q7 <-
+  H2Q7 %>% group_by(age) %>% summarise(expression = mean(expression))
+H2Q7
+```
+
+```{r}
+ggplot(data = c4b,
+       mapping = aes(
+         x = as.factor(age),
+         y = expression,
+         fill = as.factor(age)
+       )) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_fill_viridis_d() +
+  labs(title = "Expression of C4b over time",
+       x = "Age (months)",
+       y = "TPM",
+       fill = "Age")
+```
+
+```{r}
+ggplot(data = gpr17,
+       mapping = aes(
+         x = as.factor(age),
+         y = expression,
+         fill = as.factor(age)
+       )) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_fill_viridis_d() +
+  labs(title = "Expression of Gpr17 over time",
+       x = "Age (months)",
+       y = "TPM",
+       fill = "Age")
+```
+
+```{r}
+ggplot(data = H2Q6,
+       mapping = aes(
+         x = as.factor(age),
+         y = expression,
+         fill = as.factor(age)
+       )) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_fill_viridis_d() +
+  labs(title = "Expression of H2-Q6 over time",
+       x = "Age (months)",
+       y = "TPM",
+       fill = "Age")
+```
+
+```{r}
+ggplot(data = H2Q7,
+       mapping = aes(
+         x = as.factor(age),
+         y = expression,
+         fill = as.factor(age)
+       )) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_fill_viridis_d() +
+  labs(title = "Expression of H2-Q7 over time",
+       x = "Age (months)",
+       y = "TPM",
+       fill = "Age")
+```
+
+## Comparison of DE analysis methods
+
+UpSet plot:
+
+```{r}
+eR <- decide_dif_all
+
+d2 <- padj * 1
+d2 <- ifelse(is.na(d2), 0, d2)
+  
+anov <- as.data.frame(res_DE$DE * 1)
+rownames(anov) <- res_DE$gene
+
+df <- cbind(eR, d2, anov)
+colnames(df) <- c("edgeR", "DESeq2", "ANOVA")
+
+upset(as.data.frame(df), sets = colnames(df))
+
+intersect(de_genes_deseq2_ext_name, de_genes_edgeR_ext_name)
+```
+
+Comparison of p-values:
+
+```{r}
+# combine LogFC and plot
+df <- as.data.frame(cbind(p.adjust(lrt_all$table$PValue, method = "holm"), res_DE$padj))
+colnames(df) <- c("padj_edgeR", "padj_anova")
+
+ggplot(data = df, mapping = aes(x = -log10(padj_edgeR), y = -log10(padj_anova))) +
+  geom_point() + 
+  geom_abline(intercept = 0, slope = 1, color = "blue") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_color_brewer(palette = "Set1") +
+  labs(title = "Comparison of adjusted P-values", x = "-log10 P-value (egdeR)", y = "-log10 P-value (ANOVA)")
+
+df <- as.data.frame(cbind(lrt_all$table$PValue, res_DE$pval))
+colnames(df) <- c("p_edgeR", "p_anova")
+
+ggplot(data = df, mapping = aes(x = -log10(p_edgeR), y = -log10(p_anova))) +
+  geom_point() + 
+  geom_abline(intercept = 0, slope = 1, color = "blue") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  labs(title = "Comparison of P-values", x = "-log10 P-value (egdeR)", y = "-log10 P-value (ANOVA)")
+```
+
+Comparison of logFC:
+
+```{r}
+
+```
+
+
+## Grouping of the identified DEGs
+
+```{r}
+DEG <- de_genes_edgeR
+
+avg_expr <- as.data.frame(sapply(sort(unique(anno$age))[1:5], function(age) {
+  rowMeans(expr[, which(anno$age == age)])
+}))
+
+avg_expr$V6 <- unlist(as.vector(expr[, which(anno$age == 26)]))
+avg_expr$V7 <- unlist(as.vector(expr[, which(anno$age == 28)]))
+
+colnames(avg_expr) <- sort(unique(anno$age))
+
+max_age_DEG <-
+  setNames(colnames(avg_expr)[apply(avg_expr[DEG, ], 1, which.max)], DEG)
+```
+
+```{r}
+table(max_age_DEG)
+
+avg_expr_DEG_list <- tapply(names(max_age_DEG), max_age_DEG, function(x) avg_expr[x,])
+scaled_expr_DEG_list <- lapply(avg_expr_DEG_list, function(x) t(scale(t(x))))
+
+layout(matrix(1:8, nrow = 2, byrow = T))
+par(mar=c(3,3,3,3))
+for(age in names(scaled_expr_DEG_list))
+  boxplot(scaled_expr_DEG_list[[age]],
+          main = paste0(age, " (", nrow(scaled_expr_DEG_list[[age]]), ")"))
+```
+
+```{r}
+corr_DEG <- cor(t(avg_expr[DEG,]), method = "spearman")
+hcl_DEG <- hclust(as.dist(1 - corr_DEG), method = "complete")
+plot(hcl_DEG)
+```
+
+```{r}
+cl_DEG <- cutree(hcl_DEG, k = 4)
+heatmap.2(corr_DEG, Rowv = as.dendrogram(hcl_DEG), Colv = as.dendrogram(hcl_DEG),
+          trace = "none", scale = "none", labRow = NA, labCol = NA, col = viridis,
+          ColSideColors = rainbow(15)[cl_DEG])
+```
+
+```{r}
+avg_expr_DEG_list <- tapply(names(cl_DEG), cl_DEG, function(x) avg_expr[x,])
+scaled_expr_DEG_list <- lapply(avg_expr_DEG_list, function(x) t(scale(t(x))))
+
+layout(matrix(1:4, nrow = 2, byrow = T))
+for(cl in 1:4)
+  boxplot(scaled_expr_DEG_list[[cl]],
+          main = paste0(cl, " (", nrow(scaled_expr_DEG_list[[cl]]), ")"))
+```
+
+```{r}
+# cluster 1:
+rownames(scaled_expr_DEG_list[[1]])
+print("")
+
+# cluster 2:
+rownames(scaled_expr_DEG_list[[2]])
+print("")
+
+# cluster 3:
+rownames(scaled_expr_DEG_list[[3]])
+print("")
+
+# cluster 4:
+rownames(scaled_expr_DEG_list[[4]])
+```
+
+## Making sense of the genes
+
+*Frequency-based method DAVID* (Not optimal as we have low number of DE genes)
+```{r, eval=FALSE}
+#I have to delete .version
+expr_no_idversion <- expr
+rownames(expr_no_idversion) <- sub("\\.\\d+$", "", rownames(expr_no_idversion))
+
+write.table(meta_genes[meta_genes$ensembl_gene_id_version %in% names(which(cl_DEG==2)), "ensembl_gene_id"],
+            file = "genes_C2.txt",
+            quote = F, row.names = F, col.names = F)
+write.table(meta_genes[meta_genes$expressed, "ensembl_gene_id"],
+            file = "genes_expressed.txt",
+            quote = F, row.names = F, col.names = F)
+```
+
+Cluster 3 is the one with down expression progressively across ages, therefore:
+```{r, eval= FALSE}
+#I have to delete .version
+expr_no_idversion <- expr
+rownames(expr_no_idversion) <- sub("\\.\\d+$", "", rownames(expr_no_idversion))
+
+write.table(meta_genes[meta_genes$ensembl_gene_id_version %in% names(which(cl_DEG==3)), "ensembl_gene_id"],
+            file = "genes_C3.txt",
+            quote = F, row.names = F, col.names = F)
+write.table(meta_genes[meta_genes$expressed, "ensembl_gene_id"],
+            file = "genes_expressed.txt",
+            quote = F, row.names = F, col.names = F)
+```
+
+Cluster 1 is the one with up expression progressively across ages, therefore:
+```{r, eval=FALSE}
+#I have to delete .version
+expr_no_idversion <- expr
+rownames(expr_no_idversion) <- sub("\\.\\d+$", "", rownames(expr_no_idversion))
+
+write.table(meta_genes[meta_genes$ensembl_gene_id_version %in% names(which(cl_DEG==1)), "ensembl_gene_id"],
+            file = "genes_C1.txt",
+            quote = F, row.names = F, col.names = F)
+write.table(meta_genes[meta_genes$expressed, "ensembl_gene_id"],
+            file = "genes_expressed.txt",
+            quote = F, row.names = F, col.names = F)
+```
+
+And now cluster 4:
+```{r, eval=FALSE}
+#I have to delete .version
+expr_no_idversion <- expr
+rownames(expr_no_idversion) <- sub("\\.\\d+$", "", rownames(expr_no_idversion))
+
+write.table(meta_genes[meta_genes$ensembl_gene_id_version %in% names(which(cl_DEG==4)), "ensembl_gene_id"],
+            file = "genes_C4.txt",
+            quote = F, row.names = F, col.names = F)
+write.table(meta_genes[meta_genes$expressed, "ensembl_gene_id"],
+            file = "genes_expressed.txt",
+            quote = F, row.names = F, col.names = F)
+```
+
+*Rank-based method GSEA*
+
+
+```{r}
+DE_A26 <- DE_test(expr = expr[meta_genes$expressed,],
+                 cond = anno$age == "26",
+                 ctrl = "FALSE",
+                 covar = anno %>% dplyr::select(sex)) %>%
+  tibble::rownames_to_column("gene")
+
+scores <- setNames(sign(log(DE_A26$fc)) * (-log10(DE_A26$pval)),
+                   setNames(meta_genes$ensembl_gene_id,
+                            meta_genes$ensembl_gene_id_version)[DE_A26$gene])
+scores_ordered <- sort(scores, decreasing=T)
+
+library(msigdbr)
+genesets_celltype <- msigdbr(species = "Mus musculus", category = "C2")
+genesets_celltype_list <- tapply(genesets_celltype$ensembl_gene, genesets_celltype$gs_name, list)
+
+library(fgsea)
+fgsea_kegg <- fgsea(pathways = genesets_celltype_list,
+                    stats = scores_ordered[-1],
+                    minSize  = 15,
+                    maxSize  = 500)
+```
+
+```{r}
+fgsea_kegg[order(NES,decreasing=T),][1:10,]
+```
+```{r}
+library(msigdbr)
+genesets_celltype <- msigdbr(species = "Mus musculus", category = "C8")
+genesets_celltype_list <- tapply(genesets_celltype$ensembl_gene, genesets_celltype$gs_name, list)
+
+library(fgsea)
+fgsea_kegg <- fgsea(pathways = genesets_celltype_list,
+                    stats = scores_ordered[-1],
+                    minSize  = 15,
+                    maxSize  = 500)
+
+fgsea_kegg[order(NES,decreasing=T),][1:10,]
+```
+```{r}
+DE_A28 <- DE_test(expr = expr[meta_genes$expressed,],
+                 cond = anno$age == "28",
+                 ctrl = "FALSE",
+                 covar = anno %>% dplyr::select(sex)) %>%
+  tibble::rownames_to_column("gene")
+
+scores <- setNames(sign(log(DE_A28$fc)) * (-log10(DE_A28$pval)),
+                   setNames(meta_genes$ensembl_gene_id,
+                            meta_genes$ensembl_gene_id_version)[DE_A28$gene])
+scores_ordered <- sort(scores, decreasing=T)
+
+genesets_celltype <- msigdbr(species = "Mus musculus", category = "C2")
+genesets_celltype_list <- tapply(genesets_celltype$ensembl_gene, genesets_celltype$gs_name, list)
+
+fgsea_kegg <- fgsea(pathways = genesets_celltype_list,
+                    stats = scores_ordered[-1],
+                    minSize  = 15,
+                    maxSize  = 500)
+
+fgsea_kegg[order(NES,decreasing=T),][1:10,]
+```
+```{r}
+DE_A3 <- DE_test(expr = expr[meta_genes$expressed,],
+                 cond = anno$age == "3",
+                 ctrl = "FALSE",
+                 covar = anno %>% dplyr::select(sex)) %>%
+  tibble::rownames_to_column("gene")
+
+scores <- setNames(sign(log(DE_A3$fc)) * (-log10(DE_A3$pval)),
+                   setNames(meta_genes$ensembl_gene_id,
+                            meta_genes$ensembl_gene_id_version)[DE_A3$gene])
+scores_ordered <- sort(scores, decreasing=T)
+
+genesets_celltype <- msigdbr(species = "Mus musculus", category = "C2")
+genesets_celltype_list <- tapply(genesets_celltype$ensembl_gene, genesets_celltype$gs_name, list)
+
+fgsea_kegg <- fgsea(pathways = genesets_celltype_list,
+                    stats = scores_ordered,
+                    minSize  = 15,
+                    maxSize  = 500)
+
+fgsea_kegg[order(NES,decreasing=T),][1:10,]
+```
+```{r}
+DE_A12 <- DE_test(expr = expr[meta_genes$expressed,],
+                 cond = anno$age == "12",
+                 ctrl = "FALSE",
+                 covar = anno %>% dplyr::select(sex)) %>%
+  tibble::rownames_to_column("gene")
+
+scores <- setNames(sign(log(DE_A12$fc)) * (-log10(DE_A12$pval)),
+                   setNames(meta_genes$ensembl_gene_id,
+                            meta_genes$ensembl_gene_id_version)[DE_A12$gene])
+scores_ordered <- sort(scores, decreasing=T)
+
+genesets_celltype <- msigdbr(species = "Mus musculus", category = "C2")
+genesets_celltype_list <- tapply(genesets_celltype$ensembl_gene, genesets_celltype$gs_name, list)
+
+fgsea_kegg <- fgsea(pathways = genesets_celltype_list,
+                    stats = scores_ordered,
+                    minSize  = 15,
+                    maxSize  = 500)
+
+fgsea_kegg[order(NES,decreasing=T),][1:10,]
+```
+
+
+```{r}
+plotEnrichment(genesets_celltype_list[["PID_EPHA2_FWD_PATHWAY"]],scores_ordered) + labs(title="PID_EPHA2_FWD_PATHWAY")
+```
+
+```{r}
+fgsea_kegg[order(NES,decreasing=F),][1:10,1:7]
+```
+
+
+
+
